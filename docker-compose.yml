@@ -1,0 +1,176 @@
+version: '3.7'
+services:
+
+  warehouse_db:
+    image: postgres:14-alpine
+    container_name: warehouse_db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Almaty
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_DB=${DB_NAME}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=1500"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-p"
+      - ${DB_PORT}
+      - "-c"
+      - "hba_file=/etc/postgresql/pg_hba.conf"
+    volumes:
+      - ./docker-services/volume/db:/var/lib/postgresql/data:rw
+      - ./docker-services/db/initdb:/docker-entrypoint-initdb.d:ro
+      - ./docker-services/db/pg_hba/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    expose:
+      - ${DB_PORT}
+    ports:
+      - ${DB_PORT}:${DB_PORT}
+
+    networks:
+      warehouse_net:
+        ipv4_address: 172.22.0.3
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "3"
+
+  #  warehouse_redis:
+  #    image: redis:latest
+  #    container_name: warehouse-redis
+  #    restart: unless-stopped
+  #    env_file:
+  #      - .env
+  #    environment:
+  #      - TZ=Asia/Almaty
+  #    command: ["redis-server", "--port", "${REDIS_PORT}", "--requirepass", "$REDIS_PASS"]
+  #    expose:
+  #      - ${REDIS_PORT}
+  #    ports:
+  #      - ${REDIS_PORT}:${REDIS_PORT}
+  #    depends_on:
+  #      - warehouse_db
+  #    networks:
+  #      warehouse_net:
+  #        - ipv4_address: 172.22.0.4
+  #    deploy:
+  #      resources:
+  #        limits:
+  #          memory: 1024M
+  #    logging:
+  #      driver: json-file
+  #      options:
+  #        max-size: "200m"
+  #        max-file: "3"
+
+  warehouse_storage:
+    image: minio/minio:latest
+    container_name: warehouse_storage
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Almaty
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY}
+      - MINIO_MEDIA_BUCKET=${MINIO_MEDIA_BUCKET}
+    entrypoint: >
+      /bin/sh -c '
+        isAlive() { curl -sf http://127.0.0.1:${MINIO_API_PORT}/minio/health/live; }                    # check if Minio is alive
+        minio $0 "$@" --quiet & echo $! > /tmp/minio.pid                                                # start Minio in the background
+        while ! isAlive; do sleep 0.1; done                                                             # wait until Minio is alive
+        mc alias set minio http://127.0.0.1:${MINIO_API_PORT} ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}   # setup Minio client
+        mc mb minio/${MINIO_MEDIA_BUCKET} || true                                                       # create a test bucket
+
+        mc anonymous set-json /policies/anonymous-policy.json minio/${MINIO_MEDIA_BUCKET}
+        mc admin policy create minio rw-policy /policies/rw-policy.json
+        mc admin policy create minio ro-policy /policies/ro-policy.json
+        mc admin user add minio ${ADMIN_ACCESS_KEY} ${ADMIN_SECRET_KEY}
+        mc admin user add minio ${USER_ACCESS_KEY} ${USER_SECRET_KEY}
+        mc admin policy attach minio rw-policy --user=${ADMIN_ACCESS_KEY}
+        mc admin policy attach minio ro-policy --user=${USER_ACCESS_KEY}
+
+        kill -s INT $(cat /tmp/minio.pid) && rm /tmp/minio.pid                                          # stop Minio
+        while isAlive; do sleep 0.1; done                                                               # wait until Minio is stopped
+        exec minio $0 "$@"                                                                              # start Minio in the foreground
+      '
+    command: server /storage_data --address :${MINIO_API_PORT} --console-address :${MINIO_CONSOLE_PORT}
+    volumes:
+      - ./docker-services/volume/minio:/storage_data:rw
+      - ./docker-services/minio/mc/policies:/policies:ro
+    ports:
+      - "${MINIO_API_PORT}:${MINIO_API_PORT}"
+      - "${MINIO_CONSOLE_PORT}:${MINIO_CONSOLE_PORT}"
+    networks:
+      warehouse_net:
+        ipv4_address: 172.22.0.5
+
+
+  warehouse_backend:
+    container_name: warehouse_backend
+    build:
+      context: ./.
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Almaty
+      - DJANGO_SUPERUSER_USERNAME=${DJANGO_SUPERUSER_USERNAME}
+      - DJANGO_SUPERUSER_PASSWORD=${DJANGO_SUPERUSER_PASSWORD}
+      - DJANGO_SUPERUSER_EMAIL=${DJANGO_SUPERUSER_EMAIL}
+    volumes:
+      - ./logs/app:/drf_app/logs:rw
+      - ./warehouse_app/migrations:/drf_app/warehouse_app/migrations:rw
+      - ./authentication_app/migrations:/drf_app/authentication_app/migrations:rw
+    # ports:
+    #   - "8002:8000"
+    networks:
+      warehouse_net:
+        ipv4_address: 172.22.0.6
+    depends_on:
+      - warehouse_db
+      - warehouse_storage
+      - warehouse_nginx
+    logging:
+      driver: json-file
+      options:
+        max-size: "500m"
+        max-file: "4"
+
+
+  warehouse_nginx:
+    image: nginx:latest
+    container_name: warehouse_nginx
+    restart: unless-stopped
+    volumes:
+      - ./docker-services/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker-services/nginx/ssl:/etc/ssl/private:ro
+      - ./logs/nginx/:/var/log/nginx:rw
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      warehouse_net:
+        ipv4_address: 172.22.0.7
+#    depends_on:
+#      - warehouse_backend
+    logging:
+      driver: json-file
+      options:
+        max-size: "500m"
+        max-file: "4"
+
+
+networks:
+  warehouse_net:
+    driver: bridge
+    name: warehouse_net
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.22.0.0/24

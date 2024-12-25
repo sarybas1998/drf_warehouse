@@ -1,0 +1,14 @@
+volume/
+docker-compose.yml
+.gitignore
+.dockerignore
+Dockerfile
+logs/
+docker-services/
+.venv/
+# Pycharm project files
+.idea/
+
+# PyTest cache
+.pytest_cache/
+__pycache__/
